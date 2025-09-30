@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -15,27 +17,28 @@ import (
 )
 
 func main() {
-	// Configuration (could be extended via flags/env)
-	dataDir := "data"
-	stateDir := "state"
-	addr := ":8080"
-	workerCount := 4
+	cfg := loadConfig()
 
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if cfg.workerCount <= 0 {
+		log.Printf("invalid worker count %d, forcing to 1", cfg.workerCount)
+		cfg.workerCount = 1
+	}
+
+	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
 		log.Fatalf("failed to create data dir: %v", err)
 	}
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.stateDir, 0o755); err != nil {
 		log.Fatalf("failed to create state dir: %v", err)
 	}
 
 	// Storage
-	st, err := storage.NewFileStorage(stateDir + "/tasks.json")
+	st, err := storage.NewFileStorage(cfg.stateDir + "/tasks.json")
 	if err != nil {
 		log.Fatalf("failed to init storage: %v", err)
 	}
 
 	// Downloader
-	mgr := downloader.NewManager(st, dataDir, workerCount)
+	mgr := downloader.NewManager(st, cfg.dataDir, cfg.workerCount)
 	if err := mgr.RestoreFromStorage(); err != nil {
 		log.Fatalf("failed to restore tasks: %v", err)
 	}
@@ -43,7 +46,7 @@ func main() {
 	// API
 	handler := api.NewHandler(st, mgr)
 	srv := &http.Server{
-		Addr:              addr,
+		Addr:              cfg.addr,
 		Handler:           handler.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -53,7 +56,7 @@ func main() {
 
 	// Start server
 	go func() {
-		log.Printf("HTTP server listening on %s", addr)
+		log.Printf("HTTP server listening on %s", cfg.addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}
@@ -82,4 +85,60 @@ func main() {
 	}
 
 	log.Println("shutdown complete")
+}
+
+type config struct {
+	dataDir     string
+	stateDir    string
+	addr        string
+	workerCount int
+}
+
+const (
+	envDataDir     = "DOWNLOADER_DATA_DIR"
+	envStateDir    = "DOWNLOADER_STATE_DIR"
+	envAddr        = "DOWNLOADER_ADDR"
+	envWorkerCount = "DOWNLOADER_WORKERS"
+)
+
+func loadConfig() config {
+	cfg := config{
+		dataDir:     envOrDefault(envDataDir, "data"),
+		stateDir:    envOrDefault(envStateDir, "state"),
+		addr:        envOrDefault(envAddr, ":8080"),
+		workerCount: envOrInt(envWorkerCount, 4),
+	}
+
+	dataDirFlag := flag.String("data-dir", cfg.dataDir, "directory for downloaded files")
+	stateDirFlag := flag.String("state-dir", cfg.stateDir, "directory for task state storage")
+	addrFlag := flag.String("addr", cfg.addr, "HTTP listen address")
+	workersFlag := flag.Int("workers", cfg.workerCount, "number of download workers")
+
+	flag.Parse()
+
+	cfg.dataDir = *dataDirFlag
+	cfg.stateDir = *stateDirFlag
+	cfg.addr = *addrFlag
+	cfg.workerCount = *workersFlag
+
+	return cfg
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envOrInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			log.Printf("invalid value for %s: %v", key, err)
+			return fallback
+		}
+		return parsed
+	}
+	return fallback
 }

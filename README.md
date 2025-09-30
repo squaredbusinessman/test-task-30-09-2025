@@ -15,16 +15,29 @@
 
 ```bash
 # из корня проекта
-go run ./cmd/server
+go run ./cmd/server \
+  -addr :9090 \
+  -data-dir ./tmp/downloads \
+  -state-dir ./tmp/state \
+  -workers 8
 ```
 
-По умолчанию:
-- HTTP: `:8080`
-- Каталог загрузок: `./data`
-- Хранилище состояния: `./state/tasks.json`
-- Количество воркеров: 4
+Основные параметры можно задавать и через переменные окружения (флаги приоритетнее):
 
-Если нужно — легко параметризуется через код (env/flags можно добавить за пару минут, но пока не стал усложнять).
+| Env переменная             | Флаг          | Значение по умолчанию |
+|----------------------------|---------------|-----------------------|
+| `DOWNLOADER_ADDR`          | `-addr`       | `:8080`               |
+| `DOWNLOADER_DATA_DIR`      | `-data-dir`   | `./data`              |
+| `DOWNLOADER_STATE_DIR`     | `-state-dir`  | `./state`             |
+| `DOWNLOADER_WORKERS`       | `-workers`    | `4`                   |
+
+Переменные окружения удобно экспортировать, если конфигурация одна и та же между перезапусками:
+
+```bash
+export DOWNLOADER_ADDR=:8000
+export DOWNLOADER_WORKERS=2
+go run ./cmd/server
+```
 
 ## Быстрый тест через curl
 
