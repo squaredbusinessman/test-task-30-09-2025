@@ -22,10 +22,11 @@ type Manager struct {
 	downloadDir string
 	workers     int
 
-	mu      sync.Mutex
-	wg      sync.WaitGroup
-	closing bool
-	jobCh   chan *storage.Task
+	mu        sync.Mutex
+	wg        sync.WaitGroup
+	closing   bool
+	jobCh     chan *storage.Task
+	usedNames map[string]struct{}
 }
 
 func NewManager(st *storage.FileStorage, downloadDir string, workers int) *Manager {
@@ -34,12 +35,16 @@ func NewManager(st *storage.FileStorage, downloadDir string, workers int) *Manag
 		downloadDir: downloadDir,
 		workers:     workers,
 		jobCh:       make(chan *storage.Task, 256),
+		usedNames:   make(map[string]struct{}),
 	}
 }
 
 func (m *Manager) RestoreFromStorage() error {
 	// Enqueue tasks that are not done
 	for _, t := range m.storage.List() {
+		for i := range t.Parts {
+			m.reserveFileName(t.Parts[i].FileName)
+		}
 		if t.Status == "done" {
 			continue
 		}
@@ -75,9 +80,11 @@ func (m *Manager) CreateTask(ctx context.Context, urls []string) (*storage.Task,
 	id := randomID()
 	parts := make([]storage.FilePart, 0, len(urls))
 	for _, u := range urls {
+		baseName := safeFileName(u)
+		uniqueName := m.uniqueFileName(baseName)
 		parts = append(parts, storage.FilePart{
 			URL:        u,
-			FileName:   safeFileName(u),
+			FileName:   uniqueName,
 			BytesTotal: 0,
 			BytesDone:  0,
 			Status:     "pending",
@@ -227,4 +234,67 @@ func safeFileName(u string) string {
 		s = randomID()
 	}
 	return s
+}
+
+func (m *Manager) uniqueFileName(base string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	base = strings.TrimSpace(base)
+	base = filepath.Base(base)
+	if base == "" || base == "." {
+		base = randomID()
+	}
+
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "" {
+		stem = "file"
+	}
+
+	for attempt := 0; attempt < 1000; attempt++ {
+		name := base
+		if attempt > 0 {
+			name = fmt.Sprintf("%s-%s%s", stem, randomIDSuffix(), ext)
+		}
+		if _, taken := m.usedNames[name]; taken {
+			continue
+		}
+		if pathExists(filepath.Join(m.downloadDir, name)) {
+			m.usedNames[name] = struct{}{}
+			// we reserve the existing name to avoid reuse and continue searching
+			continue
+		}
+		m.usedNames[name] = struct{}{}
+		return name
+	}
+	// Fallback: append timestamp-based suffix outside loop to guarantee exit
+	name := fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext)
+	m.usedNames[name] = struct{}{}
+	return name
+}
+
+func (m *Manager) reserveFileName(name string) {
+	if name == "" {
+		return
+	}
+	m.mu.Lock()
+	m.usedNames[name] = struct{}{}
+	m.mu.Unlock()
+}
+
+func randomIDSuffix() string {
+	id := randomID()
+	if len(id) > 6 {
+		return id[:6]
+	}
+	return id
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true
+	}
+	return !errors.Is(err, os.ErrNotExist)
 }
