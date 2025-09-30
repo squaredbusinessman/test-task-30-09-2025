@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -246,5 +247,121 @@ func TestManagerDownloadsFromHTTPServer(t *testing.T) {
 	defer mu.Unlock()
 	if len(rangeHeaders) == 0 {
 		t.Fatalf("expected at least one request to test server")
+	}
+}
+
+func TestManagerResumeDownloadAfterRestart(t *testing.T) {
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "data")
+	stateDir := filepath.Join(tmp, "state")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+
+	st, err := storage.NewFileStorage(filepath.Join(stateDir, "tasks.json"))
+	if err != nil {
+		t.Fatalf("storage init: %v", err)
+	}
+
+	payload := []byte(strings.Repeat("resume", 10))
+	partial := 12
+	fileName := "resume.bin"
+	partialPath := filepath.Join(dataDir, fileName)
+	if err := os.WriteFile(partialPath, payload[:partial], 0o644); err != nil {
+		t.Fatalf("write partial file: %v", err)
+	}
+
+	var mu sync.Mutex
+	var rangeHeaders []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		rangeHeaders = append(rangeHeaders, r.Header.Get("Range"))
+		mu.Unlock()
+
+		start := 0
+		if rng := r.Header.Get("Range"); rng != "" {
+			if strings.HasPrefix(rng, "bytes=") {
+				if n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(rng, "bytes="), "-")); err == nil {
+					start = n
+				}
+			}
+		}
+		if start > len(payload) {
+			start = len(payload)
+		}
+
+		status := http.StatusOK
+		if start > 0 {
+			status = http.StatusPartialContent
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(payload)-1, len(payload)))
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)-start))
+		w.WriteHeader(status)
+		_, _ = w.Write(payload[start:])
+	}))
+	defer srv.Close()
+
+	task := &storage.Task{
+		ID:     "resume-task",
+		Status: "partial",
+		Parts: []storage.FilePart{
+			{
+				URL:        srv.URL + "/resume.bin",
+				FileName:   fileName,
+				BytesTotal: int64(len(payload)),
+				BytesDone:  int64(partial),
+				Status:     "downloading",
+			},
+		},
+	}
+	st.Put(task)
+
+	mgr := NewManager(st, dataDir, 1)
+	if err := mgr.RestoreFromStorage(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		stored, ok := st.Get(task.ID)
+		if ok && stored.Status == "done" {
+			if len(stored.Parts) != 1 {
+				t.Fatalf("expected single part, got %d", len(stored.Parts))
+			}
+			p := stored.Parts[0]
+			if p.Status != "done" {
+				t.Fatalf("expected part done, got %q", p.Status)
+			}
+			if p.BytesDone != int64(len(payload)) {
+				t.Fatalf("expected bytes done %d, got %d", len(payload), p.BytesDone)
+			}
+			data, err := os.ReadFile(partialPath)
+			if err != nil {
+				t.Fatalf("read file: %v", err)
+			}
+			if string(data) != string(payload) {
+				t.Fatalf("unexpected file contents")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task did not finish in time")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	mgr.Shutdown()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(rangeHeaders) == 0 {
+		t.Fatalf("expected at least one request")
+	}
+	if rangeHeaders[len(rangeHeaders)-1] != "bytes=12-" {
+		t.Fatalf("expected resume range header 'bytes=12-', got %q", rangeHeaders[len(rangeHeaders)-1])
 	}
 }
