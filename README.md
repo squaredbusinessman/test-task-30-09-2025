@@ -36,6 +36,7 @@ go run ./cmd/server \
 ```bash
 export DOWNLOADER_ADDR=:8000
 export DOWNLOADER_WORKERS=2
+unset GOROOT  # если в окружении стоит неверный путь
 go run ./cmd/server
 ```
 
